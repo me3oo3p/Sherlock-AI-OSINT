@@ -3,512 +3,781 @@ import os
 import re
 import html
 import json
-import time
 import uuid
+import time
 import sqlite3
+import logging
 import threading
-import ipaddress
+from datetime import datetime, timezone
 from urllib.parse import quote_plus, urlparse
 
 import requests
-import phonenumbers
-from flask import Flask, jsonify, Response
-from telegram import Update
+from bs4 import BeautifulSoup
+from flask import Flask, jsonify
+from telegram import (
+    Update,
+    InlineKeyboardButton,
+    InlineKeyboardMarkup,
+)
+from telegram.constants import ParseMode
 from telegram.ext import (
     Application,
     CommandHandler,
+    MessageHandler,
+    CallbackQueryHandler,
     ContextTypes,
+    filters,
 )
 
+# ==================================================
+# CONFIG
+# ==================================================
+
 BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN", "").strip()
-PORT = int(os.getenv("PORT", "10000"))
-DB_PATH = os.getenv("DB_PATH", "sherlock.db")
-REPORT_BASE_URL = os.getenv("REPORT_BASE_URL", "").rstrip("/")
+DB_PATH = os.getenv("DB_PATH", "sherlock_reports.db")
+PORT = int(os.getenv("PORT", "8080"))
+
+logging.basicConfig(
+    level=logging.INFO,
+    format="%(asctime)s | %(levelname)s | %(message)s",
+)
+log = logging.getLogger("sherlock")
 
 app = Flask(__name__)
-DB_LOCK = threading.Lock()
 
-HEADERS = {
+HTTP = requests.Session()
+HTTP.headers.update({
     "User-Agent": (
         "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
-        "AppleWebKit/537.36 Chrome/130.0 Safari/537.36"
+        "AppleWebKit/537.36 Chrome/131.0 Safari/537.36"
     )
-}
+})
 
+# ==================================================
+# DATABASE
+# ==================================================
 
-def db_connect():
+def db():
     connection = sqlite3.connect(DB_PATH, timeout=15)
     connection.row_factory = sqlite3.Row
     return connection
 
 
 def init_db():
-    with DB_LOCK:
-        with db_connect() as db:
-            db.execute("""
-                CREATE TABLE IF NOT EXISTS reports (
-                    id TEXT PRIMARY KEY,
-                    query TEXT NOT NULL,
-                    query_type TEXT NOT NULL,
-                    results TEXT NOT NULL,
-                    created_at INTEGER NOT NULL
-                )
-            """)
-            db.commit()
-
-
-def classify_query(query):
-    value = query.strip()
-
-    if not value:
-        return "empty"
-
-    if re.fullmatch(r"[^@\s]+@[^@\s]+\.[^@\s]+", value):
-        return "email"
-
-    if re.fullmatch(r"@[A-Za-z0-9_]{3,32}", value):
-        return "username"
-
-    if re.fullmatch(r"https?://\S+|www\.\S+", value, re.I):
-        return "url"
-
-    candidate = value.strip(" .")
-    try:
-        ipaddress.ip_address(candidate)
-        return "ip"
-    except ValueError:
-        pass
-
-    compact = re.sub(r"[\s()+.-]", "", value)
-    if re.fullmatch(r"\+?\d{10,15}", compact):
-        return "phone"
-
-    if re.fullmatch(r"[A-HJ-NPR-Z0-9]{17}", value.upper()):
-        return "vin"
-
-    if re.fullmatch(r"\d{10}|\d{12}|\d{13}|\d{15}", compact):
-        return "company_number"
-
-    return "general"
-
-
-def phone_details(value):
-    try:
-        number = phonenumbers.parse(value, None)
-        valid = phonenumbers.is_valid_number(number)
-        possible = phonenumbers.is_possible_number(number)
-
-        return {
-            "formatted": phonenumbers.format_number(
-                number, phonenumbers.PhoneNumberFormat.INTERNATIONAL
-            ),
-            "country_code": number.country_code,
-            "region": phonenumbers.region_code_for_number(number) or "Не определён",
-            "valid": valid,
-            "possible": possible,
-            "note": (
-                "Регион и код не гарантируют текущего оператора или местоположение. "
-                "Номер мог быть перенесён к другому оператору."
-            ),
-        }
-    except Exception:
-        return {
-            "note": (
-                "Не удалось разобрать номер. Попробуйте международный формат, "
-                "например +79991234567."
+    with db() as conn:
+        conn.execute("""
+            CREATE TABLE IF NOT EXISTS reports (
+                id TEXT PRIMARY KEY,
+                user_id INTEGER,
+                query TEXT,
+                category TEXT,
+                results TEXT,
+                created_at TEXT
             )
-        }
+        """)
 
 
-def extract_results(query, query_type):
-    """
-    Ищет только общедоступные страницы.
-    Поисковик может ограничивать запросы, поэтому отсутствие результатов
-    не означает, что упоминаний в интернете нет.
-    """
-    queries = [query]
+def save_report(user_id, query, category, results):
+    report_id = uuid.uuid4().hex[:10]
+    created = datetime.now(timezone.utc).isoformat()
 
-    if query_type == "phone":
-        digits = re.sub(r"\D", "", query)
-        queries = list(dict.fromkeys([
+    with db() as conn:
+        conn.execute("""
+            INSERT INTO reports
+            (id, user_id, query, category, results, created_at)
+            VALUES (?, ?, ?, ?, ?, ?)
+        """, (
+            report_id,
+            user_id,
             query,
-            digits,
-            "+" + digits if digits else query,
-        ]))
-
-    elif query_type == "email":
-        queries = [f'"{query}"']
-
-    elif query_type == "username":
-        username = query.lstrip("@")
-        queries = [
-            f'"{username}"',
-            f'"@{username}"',
-        ]
-
-    elif query_type == "url":
-        parsed = urlparse(
-            query if query.lower().startswith(("http://", "https://"))
-            else "https://" + query
-        )
-        domain = parsed.netloc or parsed.path
-        queries = [domain, f'"{domain}"']
-
-    elif query_type == "ip":
-        queries = [query, f'"{query}"']
-
-    elif query_type == "vin":
-        queries = [query.upper(), f'"{query.upper()}"']
-
-    elif query_type == "company_number":
-        queries = [query, f'"{query}"']
-
-    collected = []
-    seen = set()
-    failures = []
-
-    for search_term in queries[:3]:
-        try:
-            response = requests.get(
-                "https://html.duckduckgo.com/html/",
-                params={"q": search_term},
-                headers=HEADERS,
-                timeout=12,
-            )
-
-            if response.status_code != 200:
-                failures.append(
-                    f"Поисковик вернул HTTP {response.status_code}"
-                )
-                continue
-
-            from bs4 import BeautifulSoup
-            soup = BeautifulSoup(response.text, "html.parser")
-
-            blocks = soup.select(".result")
-            for block in blocks:
-                link = block.select_one(".result__a")
-                snippet = block.select_one(".result__snippet")
-
-                if not link:
-                    continue
-
-                title = link.get_text(" ", strip=True)
-                href = link.get("href", "")
-                description = (
-                    snippet.get_text(" ", strip=True)
-                    if snippet else ""
-                )
-
-                if not href.startswith(("http://", "https://")):
-                    continue
-
-                key = href.split("#", 1)[0]
-                if key in seen:
-                    continue
-
-                seen.add(key)
-                collected.append({
-                    "title": title[:300],
-                    "url": href[:1500],
-                    "snippet": description[:1000],
-                })
-
-            time.sleep(1)
-
-        except requests.RequestException as exc:
-            failures.append(type(exc).__name__)
-        except Exception as exc:
-            failures.append(type(exc).__name__)
-
-    status = "ok" if collected else (
-        "blocked" if failures else "no_results"
-    )
-
-    return {
-        "status": status,
-        "items": collected[:20],
-        "message": (
-            "Найдены публичные страницы."
-            if collected else
-            "Поисковик мог ограничить запрос или не вернуть подходящие "
-            "страницы. Это не доказывает отсутствие информации."
-        ),
-        "diagnostics": list(dict.fromkeys(failures))[:3],
-    }
-
-
-def save_report(query, query_type, result):
-    report_id = uuid.uuid4().hex[:12]
-    payload = json.dumps(result, ensure_ascii=False)
-
-    with DB_LOCK:
-        with db_connect() as db:
-            db.execute(
-                """
-                INSERT INTO reports
-                (id, query, query_type, results, created_at)
-                VALUES (?, ?, ?, ?, ?)
-                """,
-                (report_id, query, query_type, payload, int(time.time())),
-            )
-            db.commit()
+            category,
+            json.dumps(results, ensure_ascii=False),
+            created,
+        ))
 
     return report_id
 
 
-def get_report(report_id):
-    with DB_LOCK:
-        with db_connect() as db:
-            row = db.execute(
-                "SELECT * FROM reports WHERE id = ?",
-                (report_id,),
-            ).fetchone()
-
-    if not row:
-        return None
-
-    return {
-        "id": row["id"],
-        "query": row["query"],
-        "query_type": row["query_type"],
-        "results": json.loads(row["results"]),
-        "created_at": row["created_at"],
-    }
+def get_report(report_id, user_id):
+    with db() as conn:
+        return conn.execute("""
+            SELECT * FROM reports
+            WHERE id = ? AND user_id = ?
+        """, (report_id, user_id)).fetchone()
 
 
-def format_report(report_id, query, query_type, result):
+# ==================================================
+# CLASSIFICATION
+# ==================================================
+
+def classify_query(query):
+    value = query.strip()
+
+    if re.fullmatch(r"[^@\s]+@[^@\s]+\.[^@\s]+", value):
+        return "Email"
+
+    if value.startswith("@"):
+        return "Username"
+
+    if re.fullmatch(r"https?://\S+|www\.\S+", value, re.I):
+        return "URL"
+
+    if re.fullmatch(r"\d{1,3}(?:\.\d{1,3}){3}", value):
+        return "IP"
+
+    if re.fullmatch(r"\+?[\d\s()\-]{7,20}", value):
+        return "Телефон"
+
+    if re.fullmatch(r"[A-HJ-NPR-Z0-9]{17}", value.upper()):
+        return "VIN"
+
+    if re.fullmatch(r"\d{10}|\d{12}|\d{13}", value):
+        return "Возможный номер реестра"
+
+    return "Общий поиск"
+
+
+# ==================================================
+# PUBLIC WEB SEARCH
+# ==================================================
+
+def search_public_web(query, limit=7):
+    """
+    Searches publicly indexed web pages.
+    Search engines may block requests; that is reported explicitly.
+    """
+    url = "https://html.duckduckgo.com/html/"
+    results = []
+
+    try:
+        response = HTTP.get(
+            url,
+            params={"q": query},
+            timeout=12,
+        )
+
+        if response.status_code != 200:
+            log.warning("Search engine returned HTTP %s",
+                        response.status_code)
+            return []
+
+        soup = BeautifulSoup(response.text, "html.parser")
+
+        for item in soup.select(".result"):
+            title_node = item.select_one(".result__a")
+            snippet_node = item.select_one(".result__snippet")
+
+            if not title_node:
+                continue
+
+            title = title_node.get_text(" ", strip=True)
+            link = title_node.get("href", "").strip()
+            snippet = (
+                snippet_node.get_text(" ", strip=True)
+                if snippet_node else ""
+            )
+
+            if not link.startswith("http"):
+                continue
+
+            if not title:
+                continue
+
+            results.append({
+                "title": title[:250],
+                "url": link[:1500],
+                "snippet": snippet[:600],
+            })
+
+            if len(results) >= limit:
+                break
+
+    except requests.RequestException as exc:
+        log.warning("Public search failed: %s", exc)
+
+    except Exception:
+        log.exception("Unexpected search error")
+
+    return results
+
+
+def make_search_links(query):
+    q = quote_plus(query)
+    return [
+        {
+            "title": "Открыть поиск Google",
+            "url": f"https://www.google.com/search?q={q}",
+            "snippet": "Откроет результаты поиска в браузере.",
+        },
+        {
+            "title": "Открыть поиск Bing",
+            "url": f"https://www.bing.com/search?q={q}",
+            "snippet": "Альтернативный поисковик.",
+        },
+        {
+            "title": "Открыть поиск DuckDuckGo",
+            "url": f"https://duckduckgo.com/?q={q}",
+            "snippet": "Альтернативный поисковик.",
+        },
+    ]
+
+
+def build_queries(query, category):
+    value = query.strip()
+    clean = value.removeprefix("@").strip()
+
+    if category == "Username":
+        return [
+            f'"{clean}"',
+            f'site:vk.com "{clean}"',
+            f'site:t.me "{clean}"',
+            f'site:instagram.com "{clean}"',
+            f'site:tiktok.com "{clean}"',
+        ]
+
+    if category == "Email":
+        return [
+            f'"{value}"',
+        ]
+
+    if category == "Телефон":
+        digits = re.sub(r"\D", "", value)
+        # Не перебираем варианты номера и не связываем его
+        # автоматически с частными лицами.
+        return [f'"{digits}"']
+
+    if category == "IP":
+        return [
+            f'"{value}"',
+            f'"{value}" domain',
+        ]
+
+    if category == "VIN":
+        return [
+            f'"{value.upper()}"',
+        ]
+
+    if category == "URL":
+        parsed = urlparse(
+            value if value.startswith(("http://", "https://"))
+            else "https://" + value
+        )
+        domain = parsed.hostname or value
+        return [
+            f'"{domain}"',
+            f'site:{domain}',
+        ]
+
+    return [f'"{value}"', value]
+
+
+# ==================================================
+# REPORT FORMATTING
+# ==================================================
+
+def make_report_text(query, category, results, report_id):
+    safe_query = html.escape(query)
+    safe_category = html.escape(category)
+
     lines = [
-        "🔎 Sherlock AI OSINT",
-        "",
-        f"Запрос: {query}",
-        f"Тип: {query_type}",
-        f"Статус: {result['status']}",
+        "🕵️ <b>SHERLOCK AI OSINT</b>",
+        "━━━━━━━━━━━━━━━━━━",
+        f"🔎 <b>Запрос:</b> <code>{safe_query}</code>",
+        f"📂 <b>Тип:</b> {safe_category}",
+        f"📊 <b>Результатов:</b> {len(results)}",
         "",
     ]
 
-    if query_type == "phone":
-        details = phone_details(query)
+    if results:
+        lines.append("<b>📚 Найденные публичные источники</b>")
+        lines.append("")
+
+        for index, result in enumerate(results[:10], start=1):
+            title = html.escape(result.get("title", "Без названия"))
+            link = html.escape(result.get("url", ""), quote=True)
+            snippet = html.escape(result.get("snippet", ""))
+
+            lines.append(f"<b>{index}. {title}</b>")
+            lines.append(f'🔗 <a href="{link}">Открыть источник</a>')
+
+            if snippet:
+                lines.append(snippet[:500])
+
+            lines.append("")
+    else:
         lines.extend([
-            "📱 Информация о формате номера:",
-            f"Международный формат: {details.get('formatted', 'не определён')}",
-            f"Код страны: {details.get('country_code', 'не определён')}",
-            f"Регион: {details.get('region', 'не определён')}",
-            f"Валидный формат: {details.get('valid', 'не определён')}",
+            "⚠️ <b>Поиск не вернул результатов.</b>",
             "",
-            details.get("note", ""),
+            "Возможные причины:",
+            "• поисковик ограничил автоматические запросы;",
+            "• страницы не проиндексированы;",
+            "• запрос слишком общий;",
+            "",
+            "Ниже доступны прямые ссылки на поисковики.",
             "",
         ])
 
-    items = result.get("items", [])
-    if items:
-        lines.append("🌐 Публичные результаты:")
-        for index, item in enumerate(items[:10], start=1):
-            lines.append(f"{index}. {item['title']}")
-            lines.append(item["url"])
-            if item.get("snippet"):
-                lines.append(item["snippet"])
-            lines.append("")
-    else:
-        lines.append(result.get("message", "Результаты не найдены."))
-        diagnostics = result.get("diagnostics", [])
-        if diagnostics:
-            lines.append("Диагностика: " + ", ".join(diagnostics))
-        lines.append("")
-
-    lines.append(f"ID отчёта: {report_id}")
-    if REPORT_BASE_URL:
-        lines.append(f"Отчёт: {REPORT_BASE_URL}/r/{report_id}")
+        for item in make_search_links(query):
+            title = html.escape(item["title"])
+            link = html.escape(item["url"], quote=True)
+            lines.append(f'🌐 <a href="{link}">{title}</a>')
 
     lines.extend([
         "",
-        "Важно: используются публичные веб-страницы. "
-        "Результаты требуют проверки по первоисточникам.",
+        "━━━━━━━━━━━━━━━━━━",
+        f"🧾 <b>Отчёт:</b> <code>{report_id}</code>",
+        "",
+        "ℹ️ Совпадение имени или username не доказывает, "
+        "что найденный профиль принадлежит искомому человеку.",
+        "Проверяйте каждый результат по первоисточнику.",
     ])
 
     return "\n".join(lines)
 
 
-async def start_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    text = (
-        "🕵️ Sherlock AI OSINT\n\n"
-        "Поиск по общедоступным источникам.\n\n"
-        "Команда:\n"
-        "/search запрос\n\n"
-        "Примеры:\n"
-        "/search +79991234567\n"
-        "/search example@example.com\n"
-        "/search @username\n"
-        "/search example.com\n"
-        "/search 8.8.8.8\n"
-        "/search название компании\n\n"
-        "/report ID — открыть сохранённый отчёт\n"
-        "/status — состояние бота\n"
-        "/clear — удалить контекст текущего диалога\n\n"
-        "Бот не ищет закрытые документы, банковские данные "
-        "или домашние адреса частных лиц."
-    )
-    await update.effective_message.reply_text(text)
+# ==================================================
+# TELEGRAM MENU
+# ==================================================
+
+def main_menu():
+    return InlineKeyboardMarkup([
+        [
+            InlineKeyboardButton("🔎 Поиск", callback_data="help_search"),
+            InlineKeyboardButton("🌐 Домен / IP", callback_data="help_network"),
+        ],
+        [
+            InlineKeyboardButton("💬 Username", callback_data="help_username"),
+            InlineKeyboardButton("🏢 Компании", callback_data="help_company"),
+        ],
+        [
+            InlineKeyboardButton("📄 Мои отчёты", callback_data="my_reports"),
+            InlineKeyboardButton("ℹ️ Помощь", callback_data="help"),
+        ],
+    ])
 
 
-async def search_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    query = " ".join(context.args).strip()
+START_TEXT = """
+🕵️ <b>SHERLOCK AI OSINT</b>
+<i>Публичный поиск и анализ открытых источников</i>
 
-    if not query:
-        await update.effective_message.reply_text(
-            "Укажи запрос после команды.\nПример: /search example.com"
-        )
-        return
+━━━━━━━━━━━━━━━━━━
 
-    if len(query) > 200:
-        await update.effective_message.reply_text(
-            "Слишком длинный запрос. Максимум — 200 символов."
-        )
-        return
+👤 <b>Публичные упоминания</b>
+ФИО, username, никнеймы и ключевые слова.
 
-    query_type = classify_query(query)
-    if query_type == "empty":
-        await update.effective_message.reply_text("Пустой запрос.")
-        return
+📲 <b>Контакты</b>
+Поиск открыто опубликованных упоминаний email и телефона.
 
-    status_message = await update.effective_message.reply_text(
-        "🔎 Проверяю общедоступные страницы. Это может занять несколько секунд…"
-    )
+💬 <b>Социальные сети</b>
+VK, Telegram, TikTok, Instagram и Одноклассники.
 
-    result = extract_results(query, query_type)
-    report_id = save_report(query, query_type, result)
-    report_text = format_report(report_id, query, query_type, result)
+🌐 <b>Интернет-инфраструктура</b>
+Домены, IP и публичные технические сведения.
 
-    # Telegram message limit is 4096 characters.
-    if len(report_text) > 3900:
-        report_text = report_text[:3800] + "\n\nОтчёт сокращён."
-        if REPORT_BASE_URL:
-            report_text += f"\nПолный отчёт: {REPORT_BASE_URL}/r/{report_id}"
+🚘 <b>Транспорт</b>
+Поиск публичных упоминаний VIN и автомобилей.
 
-    try:
-        await status_message.edit_text(report_text, disable_web_page_preview=True)
-    except Exception:
-        await update.effective_message.reply_text(
-            report_text, disable_web_page_preview=True
-        )
+🏢 <b>Юридические лица</b>
+Поиск открытых сведений о компаниях и ИП.
+
+━━━━━━━━━━━━━━━━━━
+
+<b>Как пользоваться:</b>
+Отправь запрос обычным сообщением или используй:
+
+/search запрос — общий поиск
+/tag ключевые слова — поиск по теме
+/inn номер — поиск по открытым реестрам компаний
+/domain example.com — поиск по домену
+/ip 192.0.2.1 — поиск публичных упоминаний IP
+/report ID — открыть сохранённый отчёт
+/status — состояние бота
+/clear — удалить свои отчёты
+
+<i>Бот не подтверждает личность только по совпадению имени
+и не ищет закрытые персональные данные.</i>
+"""
 
 
-async def report_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    if not context.args:
-        await update.effective_message.reply_text(
-            "Укажи ID отчёта: /report ID"
-        )
-        return
-
-    report = get_report(context.args[0].strip())
-    if not report:
-        await update.effective_message.reply_text(
-            "Отчёт не найден. Проверь ID."
-        )
-        return
-
+async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.effective_message.reply_text(
-        format_report(
-            report["id"],
-            report["query"],
-            report["query_type"],
-            report["results"],
-        )[:3900],
+        START_TEXT,
+        parse_mode=ParseMode.HTML,
+        reply_markup=main_menu(),
         disable_web_page_preview=True,
     )
 
 
-async def status_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+async def help_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.effective_message.reply_text(
-        "✅ Sherlock AI OSINT запущен.\n"
-        "Хранилище: SQLite\n"
-        "Поиск: публичные веб-страницы\n"
-        "Команда: /search запрос"
+        START_TEXT,
+        parse_mode=ParseMode.HTML,
+        reply_markup=main_menu(),
+        disable_web_page_preview=True,
     )
 
 
-async def clear_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    context.user_data.clear()
-    await update.effective_message.reply_text(
-        "Контекст текущего диалога очищен. Сохранённые отчёты не удалены."
+async def menu_callback(
+    update: Update,
+    context: ContextTypes.DEFAULT_TYPE,
+):
+    query = update.callback_query
+    await query.answer()
+
+    messages = {
+        "help_search": (
+            "🔎 <b>Общий поиск</b>\n"
+            "Пример: <code>/search название проекта</code>"
+        ),
+        "help_network": (
+            "🌐 <b>Домен и IP</b>\n"
+            "<code>/domain example.com</code>\n"
+            "<code>/ip 192.0.2.1</code>"
+        ),
+        "help_username": (
+            "💬 <b>Поиск username</b>\n"
+            "Пример: <code>/search @username</code>\n"
+            "Ищем публичные страницы и упоминания."
+        ),
+        "help_company": (
+            "🏢 <b>Поиск компаний</b>\n"
+            "Пример: <code>/inn 7707083893</code>\n"
+            "Используй номер юридического лица или ИП."
+        ),
+        "help": START_TEXT,
+    }
+
+    if query.data == "my_reports":
+        await query.edit_message_text(
+            "📄 Чтобы открыть отчёт, отправь:\n"
+            "<code>/report ID</code>\n\n"
+            "ID указан в конце каждого отчёта.",
+            parse_mode=ParseMode.HTML,
+        )
+        return
+
+    await query.edit_message_text(
+        messages.get(query.data, START_TEXT),
+        parse_mode=ParseMode.HTML,
+        reply_markup=main_menu(),
+        disable_web_page_preview=True,
     )
 
+
+# ==================================================
+# SEARCH HANDLER
+# ==================================================
+
+async def perform_search(update, context, query_text, forced_category=None):
+    query_text = query_text.strip()
+
+    if not query_text:
+        await update.effective_message.reply_text(
+            "Укажи запрос после команды.\n"
+            "Пример: /search @username"
+        )
+        return
+
+    if len(query_text) > 250:
+        await update.effective_message.reply_text(
+            "⚠️ Запрос слишком длинный. Максимум 250 символов."
+        )
+        return
+
+    # Не принимаем запросы, явно направленные на поиск
+    # закрытых документов или идентификацию по лицу.
+    forbidden_patterns = [
+        r"\bпаспорт\b",
+        r"\bснилс\b",
+        r"\bводительск\w*\s+удостоверен",
+        r"\bнайди\s+человека\s+по\s+лицу\b",
+        r"\bтелефонн\w*\s+книг\w*",
+        r"\bутечк\w*\s+баз\w*",
+        r"\bбанковск\w*\s+клиент\w*",
+    ]
+
+    if any(re.search(p, query_text, re.I) for p in forbidden_patterns):
+        await update.effective_message.reply_text(
+            "⛔ Этот запрос направлен на поиск закрытых "
+            "персональных данных. Я могу искать публичные страницы, "
+            "открытые публикации и официальные реестры."
+        )
+        return
+
+    category = forced_category or classify_query(query_text)
+
+    status_message = await update.effective_message.reply_text(
+        "🔎 Ищу публичные результаты…"
+    )
+
+    collected = []
+    seen_urls = set()
+    search_errors = False
+
+    for search_query in build_queries(query_text, category):
+        results = await __import__("asyncio").to_thread(
+            search_public_web, search_query, 7
+        )
+
+        if not results:
+            search_errors = True
+
+        for result in results:
+            url = result["url"]
+
+            if url not in seen_urls:
+                seen_urls.add(url)
+                collected.append(result)
+
+            if len(collected) >= 10:
+                break
+
+        if len(collected) >= 10:
+            break
+
+    report_id = save_report(
+        update.effective_user.id,
+        query_text,
+        category,
+        collected,
+    )
+
+    report_text = make_report_text(
+        query_text,
+        category,
+        collected,
+        report_id,
+    )
+
+    if search_errors and not collected:
+        report_text += (
+            "\n\n⚠️ Автоматический поиск мог быть ограничен "
+            "поисковиком. Используй прямые ссылки выше."
+        )
+
+    try:
+        await status_message.edit_text(
+            report_text,
+            parse_mode=ParseMode.HTML,
+            disable_web_page_preview=True,
+        )
+    except Exception:
+        log.exception("Could not edit report message")
+        await update.effective_message.reply_text(
+            "Не удалось отобразить отчёт. Попробуй более короткий запрос."
+        )
+
+
+async def search_command(update, context):
+    await perform_search(
+        update,
+        context,
+        " ".join(context.args),
+    )
+
+
+async def tag_command(update, context):
+    await perform_search(
+        update,
+        context,
+        " ".join(context.args),
+        forced_category="Поиск по ключевым словам",
+    )
+
+
+async def inn_command(update, context):
+    value = " ".join(context.args).strip()
+
+    if not value:
+        await update.effective_message.reply_text(
+            "Пример: /inn 7707083893\n"
+            "Используй ИНН компании или ИП."
+        )
+        return
+
+    if not re.fullmatch(r"\d{10}|\d{12}", value):
+        await update.effective_message.reply_text(
+            "Для поиска компании укажи ИНН из 10 или 12 цифр."
+        )
+        return
+
+    await perform_search(
+        update,
+        context,
+        f'"{value}" компания ИНН официальный реестр',
+        forced_category="Юридическое лицо",
+    )
+
+
+async def domain_command(update, context):
+    value = " ".join(context.args).strip()
+
+    if not value:
+        await update.effective_message.reply_text(
+            "Пример: /domain example.com"
+        )
+        return
+
+    await perform_search(
+        update,
+        context,
+        value,
+        forced_category="Домен",
+    )
+
+
+async def ip_command(update, context):
+    value = " ".join(context.args).strip()
+
+    if not value:
+        await update.effective_message.reply_text(
+            "Пример: /ip 192.0.2.1"
+        )
+        return
+
+    await perform_search(
+        update,
+        context,
+        value,
+        forced_category="IP",
+    )
+
+
+async def report_command(update, context):
+    if not context.args:
+        await update.effective_message.reply_text(
+            "Пример: /report ID_ОТЧЁТА"
+        )
+        return
+
+    row = get_report(
+        context.args[0].strip(),
+        update.effective_user.id,
+    )
+
+    if not row:
+        await update.effective_message.reply_text(
+            "Отчёт не найден или принадлежит другому пользователю."
+        )
+        return
+
+    results = json.loads(row["results"])
+    text = make_report_text(
+        row["query"],
+        row["category"],
+        results,
+        row["id"],
+    )
+
+    await update.effective_message.reply_text(
+        text,
+        parse_mode=ParseMode.HTML,
+        disable_web_page_preview=True,
+    )
+
+
+async def clear_command(update, context):
+    with db() as conn:
+        conn.execute(
+            "DELETE FROM reports WHERE user_id = ?",
+            (update.effective_user.id,),
+        )
+
+    await update.effective_message.reply_text(
+        "🗑️ Твои сохранённые отчёты удалены."
+    )
+
+
+async def status_command(update, context):
+    await update.effective_message.reply_text(
+        "🟢 <b>Sherlock AI OSINT</b>\n"
+        "Бот работает.\n"
+        "Режим: поиск по открытым источникам.\n"
+        "Хранилище отчётов: SQLite.",
+        parse_mode=ParseMode.HTML,
+    )
+
+
+async def text_handler(update, context):
+    text_value = update.effective_message.text or ""
+    await perform_search(update, context, text_value)
+
+
+async def error_handler(update, context):
+    log.error(
+        "Telegram handler error",
+        exc_info=context.error,
+    )
+
+
+# ==================================================
+# HEALTH CHECK
+# ==================================================
 
 @app.get("/")
-def home():
-    return "Sherlock AI OSINT is running."
+def index():
+    return (
+        "Sherlock AI OSINT is running.",
+        200,
+        {"Content-Type": "text/plain; charset=utf-8"},
+    )
 
 
 @app.get("/health")
 def health():
-    return jsonify({"status": "ok", "service": "Sherlock AI OSINT"})
+    return jsonify({
+        "status": "ok",
+        "service": "Sherlock AI OSINT",
+        "time": datetime.now(timezone.utc).isoformat(),
+    })
 
 
-@app.get("/r/<report_id>")
-def public_report(report_id):
-    report = get_report(report_id)
-    if not report:
-        return jsonify({"error": "Report not found"}), 404
-
-    # Escape all stored values before embedding them in HTML.
-    safe_query = html.escape(report["query"])
-    safe_type = html.escape(report["query_type"])
-    safe_status = html.escape(report["results"].get("status", "unknown"))
-
-    parts = [
-        "<!doctype html><html><head><meta charset='utf-8'>",
-        "<meta name='viewport' content='width=device-width,initial-scale=1'>",
-        "<title>Sherlock AI OSINT report</title></head><body>",
-        "<h1>Sherlock AI OSINT</h1>",
-        f"<p><b>Запрос:</b> {safe_query}</p>",
-        f"<p><b>Тип:</b> {safe_type}</p>",
-        f"<p><b>Статус:</b> {safe_status}</p>",
-        "<h2>Публичные результаты</h2><ul>",
-    ]
-
-    for item in report["results"].get("items", []):
-        title = html.escape(item.get("title", "Без названия"))
-        url = item.get("url", "")
-        parsed = urlparse(url)
-        if parsed.scheme not in ("http", "https"):
-            continue
-
-        safe_url = html.escape(url, quote=True)
-        snippet = html.escape(item.get("snippet", ""))
-        parts.append(
-            f"<li><a href='{safe_url}' rel='noopener noreferrer'>"
-            f"{title}</a><p>{snippet}</p></li>"
-        )
-
-    parts.extend([
-        "</ul><p>Результаты собраны из общедоступных веб-страниц "
-        "и требуют проверки.</p></body></html>"
-    ])
-
-    return Response("\n".join(parts), mimetype="text/html")
+def run_web():
+    app.run(
+        host="0.0.0.0",
+        port=PORT,
+        debug=False,
+        use_reloader=False,
+    )
 
 
-def run_flask():
-    app.run(host="0.0.0.0", port=PORT, use_reloader=False)
-
+# ==================================================
+# START
+# ==================================================
 
 def main():
     if not BOT_TOKEN:
         raise RuntimeError(
-            "Не задан TELEGRAM_BOT_TOKEN в переменных окружения."
+            "Не задан TELEGRAM_BOT_TOKEN. "
+            "Добавь токен в переменные окружения хостинга."
         )
 
     init_db()
-    threading.Thread(target=run_flask, daemon=True).start()
+
+    threading.Thread(
+        target=run_web,
+        daemon=True,
+    ).start()
 
     application = Application.builder().token(BOT_TOKEN).build()
-    application.add_handler(CommandHandler("start", start_command))
-    application.add_handler(CommandHandler("search", search_command))
-    application.add_handler(CommandHandler("report", report_command))
-    application.add_handler(CommandHandler("status", status_command))
-    application.add_handler(CommandHandler("clear", clear_command))
 
-    print("Sherlock AI OSINT is starting...")
+    application.add_handler(CommandHandler("start", start))
+    application.add_handler(CommandHandler("help", help_command))
+    application.add_handler(CommandHandler("search", search_command))
+    application.add_handler(CommandHandler("tag", tag_command))
+    application.add_handler(CommandHandler("inn", inn_command))
+    application.add_handler(CommandHandler("domain", domain_command))
+    application.add_handler(CommandHandler("ip", ip_command))
+    application.add_handler(CommandHandler("report", report_command))
+    application.add_handler(CommandHandler("clear", clear_command))
+    application.add_handler(CommandHandler("status", status_command))
+    application.add_handler(CallbackQueryHandler(menu_callback))
+    application.add_handler(
+        MessageHandler(filters.TEXT & ~filters.COMMAND, text_handler)
+    )
+    application.add_error_handler(error_handler)
+
+    log.info("Sherlock AI OSINT starting")
     application.run_polling()
 
 

@@ -33,7 +33,7 @@ from telegram.ext import (
 # CONFIG
 # ==================================================
 
-BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN", "").strip()
+BOT_TOKEN = os.getenv("9240958999:AAFCI7X21j6GZoMHef-hoaMTwJyn4UGYyvE", ""). strip()
 DB_PATH = os.getenv("DB_PATH", "sherlock_reports.db")
 PORT = int(os.getenv("PORT", "8080"))
 
